@@ -45,6 +45,8 @@ typedef struct test_stat_t {
 	uint64_t events;
 	uint64_t nsec;
 	uint64_t cycles;
+	uint64_t cancel_cycles;
+	uint64_t set_cycles;
 
 	uint64_t cancels;
 	uint64_t sets;
@@ -129,7 +131,7 @@ static void print_usage(void)
 	       "                           0: Private timer pools\n"
 	       "                           1: Shared timer pools\n"
 	       "  -m, --mode             Select test mode. Default: 0\n"
-	       "                           0: Measure odp_schedule() overhead when using timers\n"
+	       "                           0: Measure odp_schedule() + scan overhead when using timers\n"
 	       "                           1: Measure timer set + cancel performance\n"
 	       "  -R, --rounds           Number of test rounds in timer set + cancel test.\n"
 	       "                           Default: 100000\n"
@@ -415,21 +417,17 @@ static int set_timers(test_global_t *global)
 	odp_queue_t queue;
 	odp_time_t time;
 	uint64_t tick_cur, nsec, time_ns;
-	uint64_t max_tmo_ns;
 	uint32_t i, j;
 	test_options_t *test_options = &global->test_options;
 	uint32_t num_tp    = test_options->num_tp;
 	uint32_t num_timer = test_options->num_timer;
 	uint64_t period_ns = test_options->period_ns;
 
-	max_tmo_ns = START_NS + (num_timer * period_ns);
-
 	for (i = 0; i < num_tp; i++) {
 		tp    = global->timer_pool[i].tp;
 		pool  = global->pool[i];
 		queue = global->queue[i];
 
-		nsec     = max_tmo_ns;
 		tick_cur = odp_timer_current_tick(tp);
 		time     = odp_time_global();
 		time_ns  = odp_time_to_ns(time);
@@ -442,9 +440,12 @@ static int set_timers(test_global_t *global)
 			timer_ctx_t *ctx = &global->timer_ctx[i][j];
 			odp_timer_start_t start_param;
 
+			nsec = START_NS + rand() % num_timer * period_ns;
 			/* Set timers backwards, the last timer is set first */
-			if (j == 0)
+			if (j == 0) {
+				nsec = START_NS + num_timer * period_ns;
 				ctx->last = 1;
+			}
 
 			ctx->target_ns = time_ns + nsec;
 			ctx->tp_idx    = i;
@@ -457,7 +458,6 @@ static int set_timers(test_global_t *global)
 			global->timer[i][j] = timer;
 
 			tick_ns = odp_timer_ns_to_tick(tp, nsec);
-			nsec    = nsec - period_ns;
 
 			start_param.tick_type = ODP_TIMER_TICK_ABS;
 			start_param.tick = tick_cur + tick_ns;
@@ -654,6 +654,8 @@ static int set_cancel_mode_worker(void *arg)
 {
 	uint64_t tick, start_tick, period_tick, nsec;
 	uint64_t c1, c2, diff;
+	uint64_t cancel_c1, cancel_c2, cancel_diff = 0;
+	uint64_t set_c1, set_c2, set_diff = 0;
 	int thr, status;
 	uint32_t i, j, worker_idx;
 	odp_event_t ev;
@@ -732,15 +734,11 @@ static int set_cancel_mode_worker(void *arg)
 		}
 
 		/* Cancel and set timers again */
+		cancel_c1 = odp_cpu_cycles();
 		for (i = 0; i < num_tp; i++) {
 			tp = global->timer_pool[i].tp;
 			if (tp == ODP_TIMER_POOL_INVALID)
 				continue;
-
-			start_tick  = global->timer_pool[i].start_tick;
-			period_tick = global->timer_pool[i].period_tick;
-
-			tick = odp_timer_current_tick(tp) + start_tick;
 
 			for (j = 0; j < num_timer; j++) {
 				if ((j % num_worker) != worker_idx)
@@ -761,6 +759,29 @@ static int set_cancel_mode_worker(void *arg)
 					ret = -1;
 					break;
 				}
+			}
+		}
+		cancel_c2 = odp_cpu_cycles();
+		cancel_diff += odp_cpu_cycles_diff(cancel_c2, cancel_c1);
+
+		set_c1 = odp_cpu_cycles();
+		for (i = 0; i < num_tp; i++) {
+			tp = global->timer_pool[i].tp;
+			if (tp == ODP_TIMER_POOL_INVALID)
+				continue;
+
+			start_tick  = global->timer_pool[i].start_tick;
+			period_tick = global->timer_pool[i].period_tick;
+
+			tick = odp_timer_current_tick(tp) + start_tick;
+
+			for (j = 0; j < num_timer; j++) {
+				if ((j % num_worker) != worker_idx)
+					continue;
+
+				timer = global->timer[i][j];
+				if (timer == ODP_TIMER_INVALID)
+					continue;
 
 				start_param.tick_type = ODP_TIMER_TICK_ABS;
 				start_param.tick = tick + j * period_tick;
@@ -777,6 +798,8 @@ static int set_cancel_mode_worker(void *arg)
 				}
 			}
 		}
+		set_c2 = odp_cpu_cycles();
+		set_diff += odp_cpu_cycles_diff(set_c2, set_c1);
 
 		if (test_rounds) {
 			test_rounds--;
@@ -798,6 +821,8 @@ static int set_cancel_mode_worker(void *arg)
 	global->stat[thr].rounds = test_options->test_rounds - test_rounds;
 	global->stat[thr].nsec   = nsec;
 	global->stat[thr].cycles = diff;
+	global->stat[thr].cancel_cycles = cancel_diff;
+	global->stat[thr].set_cycles = set_diff;
 
 	global->stat[thr].cancels = num_cancel;
 	global->stat[thr].sets    = num_set;
@@ -912,7 +937,7 @@ static void print_stat_sched_mode(test_global_t *global)
 	if (sum->after.num)
 		after_ave = (double)sum->after.sum_ns / sum->after.num;
 
-	printf("TOTAL (%i workers)\n", sum->num);
+	printf("TOTAL (%i workers) - schedule()\n", sum->num);
 	printf("  events:             %" PRIu64 "\n", sum->events);
 	printf("  ave time:           %.2f sec\n", sum->time_ave);
 	printf("  ave rounds per sec: %.2fM\n", (round_ave / sum->time_ave) / 1000000.0);
@@ -933,8 +958,8 @@ static void print_stat_set_cancel_mode(test_global_t *global)
 	int num = 0;
 
 	printf("\n");
-	printf("RESULTS - timer cancel + set cycles per thread:\n");
-	printf("-----------------------------------------------\n");
+	printf("RESULTS - ave timer cancel + set cycles per thread:\n");
+	printf("---------------------------------------------------\n");
 	printf("        1      2      3      4      5      6      7      8      9     10");
 
 	for (i = 0; i < ODP_THREAD_COUNT_MAX; i++) {
@@ -942,7 +967,40 @@ static void print_stat_set_cancel_mode(test_global_t *global)
 			if ((num % 10) == 0)
 				printf("\n   ");
 
-			printf("%6.1f ", (double)global->stat[i].cycles / global->stat[i].sets);
+		printf("%6.1f ", (double)global->stat[i].cycles / global->stat[i].sets);
+		num++;
+		}
+	}
+
+	num = 0;
+	printf("\n");
+	printf("RESULTS - ave timer cancel cycles per thread:\n");
+	printf("---------------------------------------------------\n");
+	printf("        1      2      3      4      5      6      7      8      9     10");
+
+	for (i = 0; i < ODP_THREAD_COUNT_MAX; i++) {
+		if (global->stat[i].rounds) {
+			if ((num % 10) == 0)
+				printf("\n   ");
+
+			printf("%6.1f ",
+			       (double)global->stat[i].cancel_cycles / global->stat[i].cancels);
+			num++;
+		}
+	}
+
+	num = 0;
+	printf("\n");
+	printf("RESULTS - ave timer set cycles per thread:\n");
+	printf("---------------------------------------------------\n");
+	printf("        1      2      3      4      5      6      7      8      9     10");
+
+	for (i = 0; i < ODP_THREAD_COUNT_MAX; i++) {
+		if (global->stat[i].rounds) {
+			if ((num % 10) == 0)
+				printf("\n   ");
+
+			printf("%6.1f ", (double)global->stat[i].set_cycles / global->stat[i].sets);
 			num++;
 		}
 	}
@@ -957,7 +1015,7 @@ static void print_stat_set_cancel_mode(test_global_t *global)
 	printf("  timer cancels:       %" PRIu64 "\n", sum->cancels);
 	printf("  cancels failed:      %" PRIu64 "\n", sum->cancels - sum->sets);
 	printf("  timer sets:          %" PRIu64 "\n", sum->sets);
-	printf("  ave time:            %.2f sec\n", sum->time_ave);
+	printf("  ave cancel+set time: %.2f sec\n", sum->time_ave);
 	printf("  cancel+set per cpu:  %.2fM per sec\n", (set_ave / sum->time_ave) / 1000000.0);
 	printf("\n");
 }
